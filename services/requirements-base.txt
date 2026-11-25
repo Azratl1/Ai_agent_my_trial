@@ -1,0 +1,17 @@
+# -*- coding: utf-8 -*-
+"""Общие runtime-зависимости Python-сервисов (api/worker/watcher).
+
+ВАЖНО: версия pip на хосте сборки должна указывать только на внутренний
+индекс (PyPI mirror закрытого контура) — в Dockerfile нет внешних репозиториев.
+"""
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.11.7
+pydantic-settings==2.8.1
+PyYAML==6.0.2
+httpx==0.28.1
+qdrant-client==1.12.1
+celery[redis]==5.4.0
+redis==5.2.1
+watchdog==6.0.0
+python-multipart==0.0.20

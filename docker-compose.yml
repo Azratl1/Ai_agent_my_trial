@@ -1,0 +1,251 @@
+# =============================================================================
+# Локальный ИИ-агент проверки документов — 100% OFFLINE (Strict No-Egress)
+# =============================================================================
+# Сетевая модель:
+#   - agent_internal (internal: true) — БД, инференс, воркеры. Без шлюза,
+#     без DNS наружу, физически не может выйти в интернет.
+#   - agent_edge     (internal: true) — только Open WebUI <-> FastAPI/Ollama.
+#   - Поружу проброшены лишь UI/API на loopback (127.0.0.1) — доступ сотрудников
+#     через внутреннюю LAN, но НЕ из интернета.
+# =============================================================================
+
+name: doc-audit-agent
+
+x-offline-env: &offline-env
+  # Ключевые флаги полного автономного режима
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  HF_DATASETS_OFFLINE: "1"
+  SENTENCE_TRANSFORMERS_HOME: /models/hf
+  DOCLING_CACHE_DIR: /models/docling
+  OLLAMA_KEEP_ALIVE: "-1"
+  # Телеметрия — везде OFF
+  OTEL_SDK_DISABLED: "true"
+  NO_TELEMETRY: "1"
+  ANALYTICS_DISABLED: "1"
+  # Сетевой lockdown внутри контейнеров (на случай ошибок compose)
+  no_proxy: "*"
+  NO_PROXY: "*"
+
+services:
+  # ---------------------------------------------------------------------------
+  # Инференс LLM + эмбеддингов (только локальные веса из volume ./ollama)
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:0.9.5
+    container_name: agent-ollama
+    restart: unless-stopped
+    networks: [agent_internal]
+    volumes:
+      - ./data/ollama:/root/.ollama          # веса qwen2.5 / bge-m3 (см. scripts/download_models.sh)
+    environment:
+      <<: *offline-env
+      OLLAMA_HOST: "0.0.0.0:11434"
+      OLLAMA_ORIGINS: "http://*,http://localhost:*"
+      OLLAMA_MODELS: /root/.ollama/models
+      OLLAMA_MAX_LOADED_MODELS: "2"
+      OLLAMA_NUM_PARALLEL: "2"
+      OLLAMA_FLASH_ATTENTION: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            # GPU NVIDIA; при отсутствии GPU Ollama автоматически деградирует на CPU
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Никаких ports: — доступен ТОЛЬКО внутри agent_internal
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "wget -qO- http://127.0.0.1:11434/api/tags >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # Векторная БД знаний/регламентов (dense + sparse, гибрид в коллекциях)
+  # ---------------------------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: agent-qdrant
+    restart: unless-stopped
+    networks: [agent_internal]
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    environment:
+      <<: *offline-env
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-changeme-internal}
+      QDRANT__TELEMETRY_DISABLED: "true"       # отключить анонимную телеметрию Qdrant
+    #ports: ["127.0.0.1:6333:6333"]           # раскомментируйте для локальной отладки REST
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "printf 'GET /readyz HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n' | nc -w2 localhost 6333 | grep -q ok"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Очередь задач (Celery broker/result backend) — строго локально
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.4-alpine
+    container_name: agent-redis
+    restart: unless-stopped
+    networks: [agent_internal]
+    command: >
+      redis-server
+      --appendonly yes
+      --requirepass ${REDIS_PASSWORD:-changeme-redis}
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+    volumes:
+      - ./data/redis:/data
+
+  # ---------------------------------------------------------------------------
+  # ORM/история проверок — PostgreSQL (или SQLite по умолчанию, см. .env)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16.4-alpine
+    container_name: agent-postgres
+    restart: unless-stopped
+    profiles: ["with-postgres"]                # включается: docker compose --profile with-postgres up
+    networks: [agent_internal]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-agent}
+      POSTGRES_USER: ${POSTGRES_USER:-agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme-pg}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+
+  # ---------------------------------------------------------------------------
+  # API-оркестратор (FastAPI): endpoints, статусы, запуск ручных проверок
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    image: local/doc-audit-api:offline
+    container_name: agent-api
+    restart: unless-stopped
+    networks: [agent_internal, agent_edge]
+    env_file: .env
+    environment:
+      <<: *offline-env
+    volumes:
+      - ./data/documents:/data                 # рабочие папки 01..05
+      - ./app/config:/app/config:ro            # checklists.yaml, prompts — read-only
+      - ./data/etalony-cache:/models/hf:ro     # офлайн-веса OCR/Docling
+      - ./data/sqlite:/var/lib/agent
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"     # только loopback/LAN-фронт
+    depends_on:
+      ollama: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+      redis: {condition: service_started}
+
+  # ---------------------------------------------------------------------------
+  # Watcher: следит за /data/01_etalony и /data/02_na_proverku, кладёт задачи в Redis
+  # ---------------------------------------------------------------------------
+  watcher:
+    build:
+      context: .
+      dockerfile: services/watcher/Dockerfile
+    image: local/doc-audit-watcher:offline
+    container_name: agent-watcher
+    restart: unless-stopped
+    networks: [agent_internal]
+    env_file: .env
+    environment:
+      <<: *offline-env
+    volumes:
+      - ./data/documents:/data
+      - ./app/config:/app/config:ro
+    depends_on:
+      api: {condition: service_started}
+
+  # ---------------------------------------------------------------------------
+  # Celery-worker: парсинг Docling/OCR, индексация Qdrant, LLM-аудит, отчеты
+  # ---------------------------------------------------------------------------
+  worker-parser:
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    image: local/doc-audit-worker:offline
+    container_name: agent-worker-parser
+    restart: unless-stopped
+    networks: [agent_internal]
+    env_file: .env
+    environment:
+      <<: *offline-env
+      CELERY_QUEUES: parse,index
+      OMP_NUM_THREADS: ${CPU_THREADS:-4}
+    volumes:
+      - ./data/documents:/data
+      - ./data/etalony-cache:/models/hf:ro
+      - ./app/config:/app/config:ro
+      - ./data/sqlite:/var/lib/agent
+    shm_size: "2gb"
+    deploy:
+      resources:
+        limits:
+          memory: 8g
+    depends_on:
+      ollama: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+      redis: {condition: service_started}
+
+  worker-audit:
+    extends:
+      service: worker-parser
+    container_name: agent-worker-audit
+    environment:
+      <<: *offline-env
+      CELERY_QUEUES: audit
+    depends_on:
+      ollama: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+      redis: {condition: service_started}
+
+  # ---------------------------------------------------------------------------
+  # Веб-интерфейс для сотрудников — подключён ТОЛЬКО к локальному Ollama/Qdrant
+  # ---------------------------------------------------------------------------
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.5.20
+    container_name: agent-webui
+    restart: unless-stopped
+    networks: [agent_edge]
+    environment:
+      <<: *offline-env
+      ENABLE_SIGNUP: "false"                    # регистрация только по выдаче администратора
+      DEFAULT_PERMISSION: "private"
+      ENABLE_ADMIN_CHAT_ACCESS: "true"
+      WEBSOCKET_ENABLED: "true"
+      # Явно запрещаем любые внешние вызовы
+      ENABLE_GOOGLE_OAUTH: "false"
+      ENABLE_MICROSOFT_OAUTH: "false"
+      RAG_EXTERNAL_WEB_LOADER: "false"          # никаких fetch на внешние URL
+      SEND_ANONYMOUS_USAGE_STATS: "false"
+      TELEMETRY_ENABLED: "false"
+    volumes:
+      - ./data/webui:/app/backend/data
+    ports:
+      - "127.0.0.1:${WEBUI_PORT:-3000}:8080"
+    depends_on:
+      api: {condition: service_started}
+      ollama: {condition: service_healthy}
+
+networks:
+  agent_internal:
+    internal: true          # <== ключевой lockdown: нет выхода в интернет
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+  agent_edge:
+    internal: true          # webui тоже без egress — наружу только published port на host
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
+
+volumes: {}
