@@ -1,0 +1,7 @@
+# Тяжёлые ML-зависимости worker'а (Docling + локальный OCR)
+docling==2.28.0
+rapidocr-onnxruntime==1.4.4
+onnxruntime==1.20.1
+pytesseract==0.3.13
+Pillow==11.1.0
+pypdfium2==4.30.1
